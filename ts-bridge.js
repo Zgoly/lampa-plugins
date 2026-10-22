@@ -2,13 +2,12 @@
 (function () {
   var REFERER = localStorage.ts_nb_referer || "http://127.0.0.1/";
 
-  var SKIP_PATHS = ["/stream/", "/gst/", "/play/", "/subs", "/playlist"];
   var SKIP_METHODS = ["PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT"];
   var SKIP_DATA_TYPES = ["script", "jsonp", "xml", "html", "blob", "arraybuffer"];
 
   var stats = (window.tsNB = { routed: 0, ok: 0, err: 0, lastError: "" });
 
-  var proxy = null;
+  var patched = false;
 
   function originOf(url) {
     try {
@@ -37,14 +36,23 @@
     }
   }
 
+  // Стримы жрёт <video>/hls.js мимо $.ajax. /gst/echo скипаем специально,
+  // если ответит ок - Lampa перейдёт на gstreamer и получит 403
+  function isMediaUrl(url) {
+    if (/[?&]play(?=&|$)/.test(url)) return true;
+    if (url.indexOf("/play/") >= 0) return true;
+    if (url.indexOf("/gst/") >= 0) return true;
+    if (url.indexOf("/download/") >= 0) return true;
+
+    return false;
+  }
+
   function skipRequest(settings, url, method) {
     if (settings.xhr || settings.xhrFields) return true;
     if (SKIP_DATA_TYPES.indexOf(String(settings.dataType || "").toLowerCase()) >= 0) return true;
     if (SKIP_METHODS.indexOf(method) >= 0) return true;
 
-    return SKIP_PATHS.some(function (path) {
-      return url.indexOf(path) >= 0;
-    });
+    return isMediaUrl(url);
   }
 
   // Вызываем beforeSend на фейковом объекте чтобы вытащить Authorization токен,
@@ -71,14 +79,16 @@
     return headers;
   }
 
+  // На этом держится предзагрузка
+  function isParserError(dataType, response) {
+    return dataType === "json" && typeof response === "string";
+  }
+
   function patchAjax() {
     var $ = window.jQuery || window.$;
 
     if (!$ || !$.ajax) return;
     if (!nativeBridgeAvailable()) return;
-
-    // Свой экземпляр Request чтобы native() уводил запрос в android_go()
-    proxy = new Lampa.Reguest();
 
     var originalAjax = $.ajax;
 
@@ -104,32 +114,25 @@
       setTimeout(function () {
         if (aborted) return;
 
+        // Свой экземпляр Request чтобы native() уводил запрос в android_go()
+        var proxy = new Lampa.Reguest();
+
         proxy.native(
           url,
           function (response) {
             if (aborted) return;
 
+            var dataType = settings.dataType || "json";
+
+            if (isParserError(dataType, response)) {
+              return fail({ status: 200, responseText: response }, "parsererror");
+            }
+
             stats.ok++;
             if (settings.success) settings.success(response, "success");
             if (settings.complete) settings.complete({ status: 200 }, "success");
           },
-          function (error, exception) {
-            if (aborted) return;
-
-            stats.err++;
-            stats.lastError = JSON.stringify(error || 0).slice(0, 200);
-
-            // лепим jqXHR-подобный объект вручную, потому что Lampa ожидает именно этот интерфейс
-            var jqXHR = { status: (error && error.status) || 0 };
-
-            jqXHR.responseText = (error && (error.responseText || error.message)) || "native error";
-            try {
-              jqXHR.responseJSON = JSON.parse(jqXHR.responseText);
-            } catch (e) {}
-
-            if (settings.error) settings.error(jqXHR, exception || "error", jqXHR.responseText);
-            if (settings.complete) settings.complete(jqXHR, "error");
-          },
+          fail,
           data,
           {
             dataType: settings.dataType || "json",
@@ -137,6 +140,24 @@
             headers: collectHeaders(settings),
           },
         );
+
+        // лепим jqXHR-подобный объект вручную, потому что Lampa ожидает именно этот интерфейс
+        function fail(error, exception) {
+          if (aborted) return;
+
+          stats.err++;
+          stats.lastError = JSON.stringify(error || 0).slice(0, 200);
+
+          var jqXHR = { status: (error && error.status) || 0 };
+
+          jqXHR.responseText = (error && (error.responseText || error.message)) || "native error";
+          try {
+            jqXHR.responseJSON = JSON.parse(jqXHR.responseText);
+          } catch (e) {}
+
+          if (settings.error) settings.error(jqXHR, exception || "error", jqXHR.responseText);
+          if (settings.complete) settings.complete(jqXHR, "error");
+        }
       }, 0);
 
       return {
@@ -145,6 +166,8 @@
         },
       };
     };
+
+    patched = true;
   }
 
   var attempts = 0;
@@ -158,7 +181,9 @@
       (window.jQuery || window.$) &&
       typeof AndroidJS !== "undefined";
 
-    if (ready || ++attempts > 40) patchAjax();
-    else setTimeout(wait, 250);
+    if (ready || ++attempts > 40) {
+      patchAjax();
+      stats.patched = patched;
+    } else setTimeout(wait, 250);
   })();
 })();
