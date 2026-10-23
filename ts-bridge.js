@@ -242,6 +242,13 @@
       },
     });
 
+    // очистка старых UI элементов (если есть)
+    var rows = Lampa.SettingsApi.getParam("server") || [];
+
+    for (var i = rows.length - 1; i >= 0; i--) {
+      if (String(rows[i].param.name || "").indexOf("ts_bridge_") === 0) rows.splice(i, 1);
+    }
+
     // строка с предупреждением
     if (bridgeState() !== "ok") {
       Lampa.SettingsApi.addParam({
